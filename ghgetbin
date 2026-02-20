@@ -1,0 +1,732 @@
+#!/usr/bin/env python3
+"""ghgetbin — manage single-binary GitHub release downloads with multi-version support."""
+
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import json
+import os
+import platform
+import re
+import shutil
+import signal
+import stat
+import sys
+import tarfile
+import tempfile
+import tomllib
+import zipfile
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from typing import NoReturn
+from urllib.request import Request, urlopen
+
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
+
+class GhbinError(Exception):
+    """Base exception for ghgetbin."""
+
+
+class AssetNotFoundError(GhbinError):
+    """No suitable asset found in a release."""
+
+
+class ApiError(GhbinError):
+    """GitHub API request failed."""
+
+
+# ---------------------------------------------------------------------------
+# Logging helpers
+# ---------------------------------------------------------------------------
+
+_verbose = False
+
+
+def _err(msg: str) -> None:
+    print(f"[ERROR] {msg}", file=sys.stderr)
+
+
+def _warn(msg: str) -> None:
+    print(f"[WARN] {msg}", file=sys.stderr)
+
+
+def _info(msg: str) -> None:
+    if _verbose:
+        print(f"[INFO] {msg}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# TOML helpers
+# ---------------------------------------------------------------------------
+
+_BARE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _escape_toml_string(value: str) -> str:
+    return (
+        value
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+        .replace("\b", "\\b")
+        .replace("\f", "\\f")
+    )
+
+
+def _write_toml(data: dict[str, dict[str, str]]) -> str:
+    """Serialize a dict of tables (each with string-valued keys) to TOML.
+
+    Only supports the data shapes used by ghgetbin: a dict of section names to
+    flat dicts of string key-value pairs.
+    """
+    lines: list[str] = []
+    for section in sorted(data):
+        if not _BARE_KEY_RE.match(section):
+            raise GhbinError(f"Invalid TOML section name: {section!r}")
+        lines.append(f"[{section}]")
+        table = data[section]
+        for key in sorted(table):
+            if not _BARE_KEY_RE.match(key):
+                raise GhbinError(f"Invalid TOML key name: {key!r}")
+            val = _escape_toml_string(table[key])
+            lines.append(f'{key} = "{val}"')
+        lines.append("")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PackageEntry:
+    """A single package definition from config."""
+    name: str
+    repo: str
+    binary: str
+    asset_pattern: str | None = None
+
+
+@dataclass
+class InstalledPackage:
+    """Runtime state for a package derived from the filesystem."""
+    name: str
+    binary: str
+    active_version: str | None
+    all_versions: list[str]
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+_DEFAULT_BIN_DIR = Path("~/bin").expanduser()
+
+
+class Config:
+    """Load, manipulate, and save ghgetbin.toml."""
+
+    def __init__(self, path: Path, bin_dir: Path, packages: dict[str, PackageEntry]) -> None:
+        self.path = path
+        self.bin_dir = bin_dir
+        self.packages = packages
+
+    @classmethod
+    def load(cls, path: Path) -> Config:
+        """Load config from *path*, warning if missing."""
+        if not path.exists():
+            _warn(f"Config file not found: {path}")
+            return cls(path, _DEFAULT_BIN_DIR, {})
+
+        text = path.read_text()
+        raw = tomllib.loads(text) if text.strip() else {}
+
+        settings_table = raw.pop("settings", None)
+        bin_dir_str = settings_table.get("bin_dir") if settings_table else None
+        bin_dir = Path(bin_dir_str).expanduser() if bin_dir_str else _DEFAULT_BIN_DIR
+
+        packages: dict[str, PackageEntry] = {}
+        for name, table in raw.items():
+            repo = table.get("repo", "")
+            binary = table.get("binary", name)
+            asset_pattern = table.get("asset_pattern")
+            packages[name] = PackageEntry(
+                name=name, repo=repo, binary=binary, asset_pattern=asset_pattern,
+            )
+        return cls(path, bin_dir, packages)
+
+    def save(self) -> None:
+        """Write current state back to the config file."""
+        data: dict[str, dict[str, str]] = {}
+        data["settings"] = {"bin_dir": str(self.bin_dir)}
+        for name, pkg in self.packages.items():
+            table: dict[str, str] = {"repo": pkg.repo}
+            if pkg.binary != name:
+                table["binary"] = pkg.binary
+            if pkg.asset_pattern:
+                table["asset_pattern"] = pkg.asset_pattern
+            data[name] = table
+        try:
+            self.path.write_text(_write_toml(data))
+        except FileNotFoundError:
+            raise GhbinError(
+                f"Cannot save config: directory '{self.path.parent}' does not exist. "
+                f"Please create it first."
+            )
+        except OSError as exc:
+            raise GhbinError(f"Cannot save config to '{self.path}': {exc}") from exc
+
+
+# ---------------------------------------------------------------------------
+# GitHub API
+# ---------------------------------------------------------------------------
+
+_GITHUB_API_BASE = "https://api.github.com/repos"
+
+
+def _get_github_token() -> str | None:
+    """Read the GitHub token from the environment."""
+    return os.environ.get("GITHUB_TOKEN")
+
+
+def _github_request(url: str) -> dict:
+    """Perform a GET request to the GitHub API, return parsed JSON."""
+    _info(f"API request: {url}")
+    headers = {"User-Agent": "ghgetbin/1.0", "Accept": "application/vnd.github+json"}
+    token = _get_github_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = Request(url, headers=headers)
+    try:
+        with urlopen(req) as resp:
+            return json.loads(resp.read())
+    except HTTPError as exc:
+        if exc.code in (403, 429):
+            reset = exc.headers.get("X-RateLimit-Reset")
+            msg = f"Rate limited ({exc.code}) fetching {url}."
+            if reset:
+                ts = datetime.fromtimestamp(int(reset), tz=timezone.utc)
+                msg += f" Resets at {ts:%Y-%m-%d %H:%M:%S %Z}."
+            raise ApiError(msg) from exc
+        raise ApiError(f"HTTP {exc.code} fetching {url}") from exc
+    except URLError as exc:
+        raise ApiError(f"Network error fetching {url}: {exc.reason}") from exc
+
+
+def get_release(repo: str, tag: str | None = None) -> dict:
+    """Fetch latest release or a specific tag."""
+    if tag:
+        url = f"{_GITHUB_API_BASE}/{repo}/releases/tags/{tag}"
+    else:
+        url = f"{_GITHUB_API_BASE}/{repo}/releases/latest"
+    return _github_request(url)
+
+
+# ---------------------------------------------------------------------------
+# Asset selection
+# ---------------------------------------------------------------------------
+
+_ARCH_ALIASES: dict[str, list[str]] = {
+    "x86_64": ["x86_64", "amd64"],
+    "amd64": ["x86_64", "amd64"],
+    "aarch64": ["aarch64", "arm64"],
+    "arm64": ["aarch64", "arm64"],
+}
+
+_DEPRIORITY_PATTERNS = (".sha256", ".sha512", ".sig", ".sbom", "checksums", ".asc", ".pem")
+
+
+def select_asset(assets: list[dict], pkg: PackageEntry) -> tuple[dict, str]:
+    """Return (asset_dict, reason) for the best release asset match."""
+    if not assets:
+        raise AssetNotFoundError(f"Release for {pkg.repo} has no assets")
+
+    # 1. explicit pattern
+    if pkg.asset_pattern:
+        for a in assets:
+            if fnmatch.fnmatch(a["name"], pkg.asset_pattern):
+                return a, f"matched asset_pattern '{pkg.asset_pattern}'"
+        raise AssetNotFoundError(
+            f"No asset matching pattern '{pkg.asset_pattern}' in release for {pkg.repo}"
+        )
+
+    # 2. detect arch
+    machine = platform.machine().lower()
+    arch_names = _ARCH_ALIASES.get(machine, [machine])
+
+    # 3. filter linux + arch
+    candidates: list[dict] = []
+    for a in assets:
+        name_lower = a["name"].lower()
+        if "linux" not in name_lower:
+            continue
+        if any(arch in name_lower for arch in arch_names):
+            candidates.append(a)
+
+    if not candidates:
+        raise AssetNotFoundError(
+            f"No Linux/{machine} asset found for {pkg.repo}. "
+            f"Available: {', '.join(a['name'] for a in assets)}"
+        )
+
+    # 4. score
+    def _score(a: dict) -> int:
+        name_lower = a["name"].lower()
+        s = 0
+        if any(name_lower.endswith(p) for p in _DEPRIORITY_PATTERNS):
+            s -= 10
+        if "musl" in name_lower:
+            s += 2
+        if name_lower.endswith(".tar.gz") or name_lower.endswith(".tgz"):
+            s += 3
+        elif name_lower.endswith(".tar.xz"):
+            s += 2
+        elif name_lower.endswith(".zip"):
+            s += 1
+        return s
+
+    candidates.sort(key=_score, reverse=True)
+    best = candidates[0]
+    reason = f"selected {best['name']} (score {_score(best)})"
+    if len(candidates) > 1:
+        _info(f"Asset candidates: {', '.join(c['name'] for c in candidates)}")
+        top_score = _score(candidates[0])
+        tied = [c for c in candidates if _score(c) == top_score]
+        if len(tied) > 1:
+            _warn(f"Ambiguous asset selection among: {', '.join(c['name'] for c in tied)}; picking {best['name']}")
+    return best, reason
+
+
+# ---------------------------------------------------------------------------
+# Archive member selection
+# ---------------------------------------------------------------------------
+
+def _find_binary_in_archive(
+    members: list[tuple[str, bool]],  # (full_path, is_executable)
+    binary: str,
+    archive_label: str,
+) -> str:
+    """Pick the best binary match from an archive's member list.
+
+    Returns the full path of the selected member.
+    Strategy: exact basename match first, then extensionless executable fallback.
+    """
+    exact: list[str] = []
+    candidates: list[str] = []
+    for path, is_exec in members:
+        basename = path.split("/")[-1]
+        if basename == binary:
+            exact.append(path)
+        elif is_exec and "." not in basename:
+            candidates.append(path)
+    if exact:
+        if len(exact) > 1:
+            _warn(f"Multiple exact matches for '{binary}': {exact}; using first")
+        return exact[0]
+    if candidates:
+        if len(candidates) > 1:
+            _warn(f"Multiple executable candidates: {candidates}; using first")
+        return candidates[0]
+    raise AssetNotFoundError(
+        f"Could not find binary '{binary}' in {archive_label}. "
+        f"Members: {[p for p, _ in members]}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Install guard (SIGINT cleanup)
+# ---------------------------------------------------------------------------
+
+@contextmanager
+def _install_guard(dest: Path):
+    """Context manager that cleans up *dest* on SIGINT or exception.
+
+    Yields a mutable dict; callers may set state["tmp"] to a temp file
+    that should also be closed on cleanup.
+    """
+    state: dict[str, tempfile.NamedTemporaryFile | None] = {"tmp": None}  # type: ignore[type-arg]
+    original = signal.getsignal(signal.SIGINT)
+
+    def _handler(signum: int, frame: object) -> None:
+        if dest.exists():
+            try:
+                dest.unlink()
+                _info(f"Cleaned up partial file: {dest}")
+            except OSError:
+                pass
+        tmp = state["tmp"]
+        if tmp:
+            try:
+                tmp.close()
+            except OSError:
+                pass
+        sys.exit(130)
+
+    signal.signal(signal.SIGINT, _handler)
+    try:
+        yield state
+    except BaseException:
+        if dest.exists():
+            try:
+                dest.unlink()
+                _info(f"Cleaned up partial file: {dest}")
+            except OSError:
+                pass
+        raise
+    finally:
+        signal.signal(signal.SIGINT, original)
+
+
+# ---------------------------------------------------------------------------
+# Filesystem operations
+# ---------------------------------------------------------------------------
+
+def get_installed(bin_dir: Path, pkg: PackageEntry) -> InstalledPackage:
+    """Derive installed state for *pkg* from the filesystem."""
+    binary = pkg.binary
+    prefix = f"{binary}-"
+    versions: list[str] = []
+    for entry in sorted(bin_dir.iterdir()) if bin_dir.is_dir() else []:
+        if entry.name.startswith(prefix) and entry.is_file() and os.access(entry, os.X_OK):
+            tag = entry.name[len(prefix):]
+            versions.append(tag)
+
+    active: str | None = None
+    link = bin_dir / binary
+    if link.is_symlink():
+        target = os.readlink(link)
+        target_name = Path(target).name
+        if target_name.startswith(prefix):
+            active = target_name[len(prefix):]
+            if active not in versions:
+                _warn(f"Symlink {link} points to {target} which is not installed")
+                active = None
+
+    return InstalledPackage(name=pkg.name, binary=binary,
+                           active_version=active, all_versions=versions)
+
+
+def download(url: str) -> tempfile.NamedTemporaryFile:  # type: ignore[type-arg]
+    """Download *url* to a NamedTemporaryFile and return it."""
+    _info(f"Downloading {url}")
+    headers = {"User-Agent": "ghgetbin/1.0"}
+    token = _get_github_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    headers["Accept"] = "application/octet-stream"
+    req = Request(url, headers=headers)
+    try:
+        resp = urlopen(req)
+    except (HTTPError, URLError) as exc:
+        raise ApiError(f"Download failed for {url}: {exc}") from exc
+    tmp = tempfile.NamedTemporaryFile(delete=True)
+    shutil.copyfileobj(resp, tmp, 1 << 16)
+    tmp.flush()
+    tmp.seek(0)
+    return tmp
+
+
+def extract_binary(tmp: tempfile.NamedTemporaryFile,  # type: ignore[type-arg]
+            asset_name: str, binary: str, dest: Path) -> None:
+    """Extract the target binary from a downloaded archive into *dest*."""
+    name_lower = asset_name.lower()
+    if name_lower.endswith(".tar.gz") or name_lower.endswith(".tgz") or name_lower.endswith(".tar.xz"):
+        mode = "r:gz" if not name_lower.endswith(".tar.xz") else "r:xz"
+        with tarfile.open(fileobj=tmp, mode=mode) as tf:
+            members = [
+                (m.name, m.mode is not None and bool(m.mode & 0o111))
+                for m in tf.getmembers() if not m.isdir()
+            ]
+            name = _find_binary_in_archive(members, binary, "archive")
+            _info(f"Extracting {name} from archive")
+            src = tf.extractfile(name)
+            if src is None:
+                raise AssetNotFoundError(f"Cannot extract {name}")
+            with open(dest, "xb") as out:
+                shutil.copyfileobj(src, out, 1 << 16)
+    elif name_lower.endswith(".zip"):
+        with zipfile.ZipFile(tmp) as zf:
+            members = [
+                (i.filename, bool(i.external_attr >> 16 & 0o111))
+                for i in zf.infolist() if not i.is_dir()
+            ]
+            name = _find_binary_in_archive(members, binary, "zip")
+            _info(f"Extracting {name} from zip")
+            with zf.open(name) as src, open(dest, "xb") as out:
+                shutil.copyfileobj(src, out, 1 << 16)
+    else:
+        # raw binary
+        _info("Treating download as raw binary")
+        with open(dest, "xb") as out:
+            tmp.seek(0)
+            shutil.copyfileobj(tmp, out, 1 << 16)
+
+
+def set_symlink(bin_dir: Path, binary: str, tag: str, *,
+                dry_run: bool = False) -> None:
+    """Atomically create/update {bin_dir}/{binary} -> {binary}-{tag}."""
+    link = bin_dir / binary
+    target = f"{binary}-{tag}"
+    if dry_run:
+        print(f"[DRY-RUN] symlink {link} -> {target}")
+        return
+    tmp_link = bin_dir / f".{binary}.tmp.{os.getpid()}"
+    try:
+        os.symlink(target, tmp_link)
+        os.replace(tmp_link, link)
+        _info(f"Symlink {link} -> {target}")
+    except OSError as exc:
+        if tmp_link.exists() or tmp_link.is_symlink():
+            tmp_link.unlink()
+        raise GhbinError(f"Failed to create symlink: {exc}") from exc
+
+
+def install_binary(bin_dir: Path, pkg: PackageEntry, tag: str,
+                   asset: dict, reason: str, *,
+                   dry_run: bool = False) -> bool:
+    """Download and install a specific release asset. Returns True if installed."""
+    binary = pkg.binary
+    dest = bin_dir / f"{binary}-{tag}"
+
+    if dest.exists():
+        _info(f"{dest} already exists, skipping download")
+        return False
+
+    if dry_run:
+        print(f"[DRY-RUN] download {asset['name']} -> {dest}")
+        print(f"[DRY-RUN] reason: {reason}")
+        return True
+
+    if not bin_dir.is_dir():
+        raise GhbinError(
+            f"Binary directory '{bin_dir}' does not exist. "
+            f"Please create it first."
+        )
+    with _install_guard(dest) as state:
+        url = asset["url"]
+        tmp = download(url)
+        state["tmp"] = tmp
+        try:
+            extract_binary(tmp, asset["name"], binary, dest)
+        finally:
+            tmp.close()
+        dest.chmod(dest.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        _info(f"Installed {dest}")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+def cmd_install(cfg: Config, dry_run: bool,
+                name: str, tag: str | None) -> None:
+    """Install latest (or specific tag) for one or all packages."""
+    if name == "all":
+        if not cfg.packages:
+            _err("No packages configured. Run `ghgetbin add <name> <owner/repo>` first.")
+            sys.exit(1)
+        if tag:
+            _err("Cannot specify a tag when installing all packages.")
+            sys.exit(1)
+        pkgs = list(cfg.packages.values())
+    else:
+        if name not in cfg.packages:
+            _err(f"Unknown package '{name}'. Run `ghgetbin list` or `ghgetbin add`.")
+            sys.exit(1)
+        pkgs = [cfg.packages[name]]
+
+    for pkg in pkgs:
+        try:
+            release = get_release(pkg.repo, tag)
+            rel_tag: str = release["tag_name"]
+            assets = release.get("assets", [])
+            asset, reason = select_asset(assets, pkg)
+            _info(f"{pkg.name}: {reason}")
+            installed = install_binary(cfg.bin_dir, pkg, rel_tag, asset, reason,
+                                       dry_run=dry_run)
+            set_symlink(cfg.bin_dir, pkg.binary, rel_tag, dry_run=dry_run)
+            if installed:
+                print(f"{pkg.name}: installed {rel_tag}")
+            else:
+                print(f"{pkg.name}: {rel_tag} already installed")
+        except GhbinError as exc:
+            _err(f"{pkg.name}: {exc}")
+            if len(pkgs) == 1:
+                sys.exit(1)
+
+
+def cmd_remove(cfg: Config, name: str) -> None:
+    """Remove a package entry from config (leaves binaries on disk)."""
+    if name not in cfg.packages:
+        _err(f"Package '{name}' not found in config. Run `ghgetbin list` or `ghgetbin add`.")
+        sys.exit(1)
+    del cfg.packages[name]
+    cfg.save()
+    print(f"Removed '{name}' from config (binaries left on disk).")
+
+
+def cmd_list(cfg: Config) -> None:
+    """Print a table of all packages and their installed versions."""
+    if not cfg.packages:
+        print("No packages configured. Run `ghgetbin add <name> <owner/repo>` first.")
+        return
+
+    rows: list[tuple[str, str, str, str, str]] = []
+    for name, pkg in sorted(cfg.packages.items()):
+        info = get_installed(cfg.bin_dir, pkg)
+        active = info.active_version or "-"
+        others = [v for v in info.all_versions if v != info.active_version]
+        rows.append((name, pkg.repo, info.binary, active, ", ".join(others) or "-"))
+
+    headers = ("NAME", "REPO", "BINARY", "ACTIVE", "OTHER VERSIONS")
+    widths = [max(len(h), *(len(r[i]) for r in rows)) for i, h in enumerate(headers)]
+    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+    print(fmt.format(*headers))
+    for row in rows:
+        print(fmt.format(*row))
+
+
+def cmd_use(cfg: Config, dry_run: bool, name: str, tag: str) -> None:
+    """Switch active symlink to an already-installed version."""
+    if name not in cfg.packages:
+        _err(f"Unknown package '{name}'. Run `ghgetbin list` or `ghgetbin add`.")
+        sys.exit(1)
+    pkg = cfg.packages[name]
+    info = get_installed(cfg.bin_dir, pkg)
+    if tag not in info.all_versions:
+        _err(
+            f"Version '{tag}' of '{name}' is not installed. "
+            f"Installed: {', '.join(info.all_versions) or 'none'}"
+        )
+        sys.exit(1)
+    set_symlink(cfg.bin_dir, pkg.binary, tag, dry_run=dry_run)
+    print(f"{name}: now using {tag}")
+
+
+def cmd_add(cfg: Config, name: str, repo: str, binary: str | None,
+            asset_pattern: str | None) -> None:
+    """Add a new package entry to config."""
+    if name in cfg.packages:
+        _err(f"Package '{name}' already exists in config.")
+        sys.exit(1)
+    if not _BARE_KEY_RE.match(name):
+        _err(f"Invalid package name '{name}' (alphanumeric, dash, underscore only).")
+        sys.exit(1)
+    parts = repo.split("/")
+    if len(parts) != 2 or not all(parts):
+        _err(f"Repo must be in 'owner/repo' format, got '{repo}'.")
+        sys.exit(1)
+    cfg.packages[name] = PackageEntry(
+        name=name, repo=repo, binary=binary or name,
+        asset_pattern=asset_pattern,
+    )
+    cfg.save()
+    print(f"Added '{name}' ({repo}) to config.")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+class _Parser(argparse.ArgumentParser):
+    """ArgumentParser with cleaner error messages."""
+
+    def error(self, message: str) -> NoReturn:
+        self.print_usage(sys.stderr)
+        self.exit(2, f"error: {message}\n")
+
+
+def build_parser() -> _Parser:
+    """Build the argparse parser."""
+    parser = _Parser(
+        prog="ghgetbin",
+        description="Manage single-binary GitHub release downloads.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "actions:\n"
+            "  config:\n"
+            "    add              Add a new package to config\n"
+            "    remove           Remove a package from config\n"
+            "  inspection:\n"
+            "    list             List packages and installed versions\n"
+            "  state:\n"
+            "    install          Install latest or a specific version\n"
+            "    use              Switch to an installed version"
+        ),
+    )
+    parser.add_argument("-v", "--verbose", action="store_true", help="show detailed output")
+    parser.add_argument("-n", "--dry-run", action="store_true", help="print what would happen, no writes")
+
+    sub = parser.add_subparsers(
+        dest="command", prog="ghgetbin [-v] [-n]",
+        title=argparse.SUPPRESS, metavar="<action>",
+    )
+    parser._action_groups.pop()  # hide subparsers from help; epilog provides the listing
+
+    # config actions
+    p_add = sub.add_parser("add", description="Add a new package to config.")
+    p_add.add_argument("name", help="short name for the package")
+    p_add.add_argument("repo", help="GitHub owner/repo")
+    p_add.add_argument("--binary", help="override binary name")
+    p_add.add_argument("--asset-pattern", help="fnmatch pattern for asset selection")
+
+    p_remove = sub.add_parser("remove", description="Remove a package from config.")
+    p_remove.add_argument("name", help="package name")
+
+    # inspection actions
+    sub.add_parser("list", description="List packages and installed versions.")
+
+    # state actions
+    p_install = sub.add_parser("install", description="Install latest or a specific version.")
+    p_install.add_argument("name", help="package name (use 'all' to install all packages)")
+    p_install.add_argument("tag", nargs="?", help="specific tag to install")
+
+    p_use = sub.add_parser("use", description="Switch to an installed version.")
+    p_use.add_argument("name", help="package name")
+    p_use.add_argument("tag", help="installed tag to activate")
+
+    return parser
+
+
+def main() -> None:
+    """Entry point."""
+    global _verbose
+
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(0)
+
+    _verbose = args.verbose
+
+    # Resolve config path
+    config_path_str = os.environ.get("GHGETBIN_CONFIG", "~/.config/ghgetbin.toml")
+    config_path = Path(config_path_str).expanduser()
+
+    cfg = Config.load(config_path)
+
+    if args.command == "install":
+        cmd_install(cfg, args.dry_run, args.name, args.tag)
+    elif args.command == "remove":
+        cmd_remove(cfg, args.name)
+    elif args.command == "list":
+        cmd_list(cfg)
+    elif args.command == "use":
+        cmd_use(cfg, args.dry_run, args.name, args.tag)
+    elif args.command == "add":
+        cmd_add(cfg, args.name, args.repo, args.binary, args.asset_pattern)
+
+
+if __name__ == "__main__":
+    main()
