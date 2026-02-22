@@ -25,6 +25,8 @@ from urllib.error import HTTPError, URLError
 from typing import NoReturn
 from urllib.request import Request, urlopen
 
+__version__ = "0.1.0"
+
 # ---------------------------------------------------------------------------
 # Exceptions
 # ---------------------------------------------------------------------------
@@ -665,6 +667,7 @@ def build_parser() -> _Parser:
             "    use              Switch to an installed version"
         ),
     )
+    parser.add_argument("-V", "--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("-v", "--verbose", action="store_true", help="show detailed output")
     parser.add_argument("-n", "--dry-run", action="store_true", help="print what would happen, no writes")
 
