@@ -25,7 +25,7 @@ from urllib.error import HTTPError, URLError
 from typing import NoReturn
 from urllib.request import Request, urlopen
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 # ---------------------------------------------------------------------------
 # Exceptions
@@ -90,7 +90,7 @@ def _write_toml(data: dict[str, dict[str, str]]) -> str:
     flat dicts of string key-value pairs.
     """
     lines: list[str] = []
-    for section in sorted(data):
+    for section in sorted(data, key=lambda s: (s != "settings", s)):
         if not _BARE_KEY_RE.match(section):
             raise GhbinError(f"Invalid TOML section name: {section!r}")
         lines.append(f"[{section}]")
