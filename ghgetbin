@@ -25,7 +25,7 @@ from urllib.error import HTTPError, URLError
 from typing import NoReturn
 from urllib.request import Request, urlopen
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 # ---------------------------------------------------------------------------
 # Exceptions
@@ -568,11 +568,14 @@ def cmd_install(cfg: Config, dry_run: bool,
                 sys.exit(1)
 
 
-def cmd_remove(cfg: Config, name: str) -> None:
+def cmd_remove(cfg: Config, dry_run: bool, name: str) -> None:
     """Remove a package entry from config (leaves binaries on disk)."""
     if name not in cfg.packages:
         _err(f"Package '{name}' not found in config. Run `ghgetbin list` or `ghgetbin add`.")
         sys.exit(1)
+    if dry_run:
+        print(f"[DRY-RUN] remove '{name}' from config")
+        return
     del cfg.packages[name]
     cfg.save()
     print(f"Removed '{name}' from config (binaries left on disk).")
@@ -616,7 +619,7 @@ def cmd_use(cfg: Config, dry_run: bool, name: str, tag: str) -> None:
     print(f"{name}: now using {tag}")
 
 
-def cmd_add(cfg: Config, name: str, repo: str, binary: str | None,
+def cmd_add(cfg: Config, dry_run: bool, name: str, repo: str, binary: str | None,
             asset_pattern: str | None) -> None:
     """Add a new package entry to config."""
     if name in cfg.packages:
@@ -629,6 +632,9 @@ def cmd_add(cfg: Config, name: str, repo: str, binary: str | None,
     if len(parts) != 2 or not all(parts):
         _err(f"Repo must be in 'owner/repo' format, got '{repo}'.")
         sys.exit(1)
+    if dry_run:
+        print(f"[DRY-RUN] add '{name}' ({repo}) to config")
+        return
     cfg.packages[name] = PackageEntry(
         name=name, repo=repo, binary=binary or name,
         asset_pattern=asset_pattern,
@@ -724,13 +730,13 @@ def main() -> None:
     if args.command == "install":
         cmd_install(cfg, args.dry_run, args.name, args.tag)
     elif args.command == "remove":
-        cmd_remove(cfg, args.name)
+        cmd_remove(cfg, args.dry_run, args.name)
     elif args.command == "list":
         cmd_list(cfg)
     elif args.command == "use":
         cmd_use(cfg, args.dry_run, args.name, args.tag)
     elif args.command == "add":
-        cmd_add(cfg, args.name, args.repo, args.binary, args.asset_pattern)
+        cmd_add(cfg, args.dry_run, args.name, args.repo, args.binary, args.asset_pattern)
 
 
 if __name__ == "__main__":
