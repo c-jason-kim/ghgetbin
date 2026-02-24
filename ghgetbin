@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import hashlib
 import json
 import os
 import platform
@@ -41,6 +42,10 @@ class AssetNotFoundError(GhbinError):
 
 class ApiError(GhbinError):
     """GitHub API request failed."""
+
+
+class ChecksumError(GhbinError):
+    """Checksum verification failed."""
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +315,169 @@ def select_asset(assets: list[dict], pkg: PackageEntry) -> tuple[dict, str]:
 
 
 # ---------------------------------------------------------------------------
+# Checksum verification
+# ---------------------------------------------------------------------------
+
+# Per-file checksum extensions, checked in priority order.
+# Prefer SHA-512 over SHA-256: strictly stronger and faster on 64-bit CPUs.
+_CHECKSUM_EXTENSIONS = (".sha512", ".sha256", ".sha512sum", ".sha256sum")
+
+# Multi-file checksum name suffixes with algorithm hints.
+# Matched case-insensitively as exact name or as a suffix after "_" / "-".
+# This handles both plain names ("checksums.txt") and versioned names
+# ("gh_2.87.3_checksums.txt", "fzf_0.68.0_checksums.txt").
+_CHECKSUM_MULTI_SUFFIXES: tuple[tuple[str, str], ...] = (
+    ("checksums.txt", ""),
+    ("sha512sums", "sha512"),
+    ("sha256sums", "sha256"),
+    ("sha512.sum", "sha512"),
+    ("sha256.sum", "sha256"),
+)
+
+_ALGO_HINT_BY_EXT = {
+    ".sha256": "sha256", ".sha256sum": "sha256",
+    ".sha512": "sha512", ".sha512sum": "sha512",
+}
+
+
+def find_checksum_asset(assets: list[dict], binary_asset_name: str) -> tuple[dict, str] | None:
+    """Find a checksum asset for *binary_asset_name* in the release assets.
+
+    Returns ``(asset_dict, algorithm_hint)`` or ``None``.
+    Algorithm hint is ``"sha256"`` / ``"sha512"`` when inferable from the
+    filename extension, otherwise ``""`` (caller must infer from content).
+    """
+    by_name: dict[str, dict] = {a["name"]: a for a in assets}
+
+    # 1. Per-file: {binary}.sha256, {binary}.sha512, ...
+    for ext in _CHECKSUM_EXTENSIONS:
+        candidate = binary_asset_name + ext
+        if candidate in by_name:
+            _info(f"Checksum asset (per-file): {candidate}")
+            return by_name[candidate], _ALGO_HINT_BY_EXT.get(ext, "")
+
+    # 2. Common multi-file names (case-insensitive suffix match)
+    for suffix, algo in _CHECKSUM_MULTI_SUFFIXES:
+        for a in assets:
+            name_lower = a["name"].lower()
+            if name_lower == suffix or name_lower.endswith("_" + suffix) or name_lower.endswith("-" + suffix):
+                _info(f"Checksum asset (multi-file): {a['name']}")
+                return a, algo
+
+    return None
+
+
+def parse_checksum(content: str, target_filename: str) -> tuple[str, str] | None:
+    """Parse checksum file *content* and extract the hash for *target_filename*.
+
+    Supports:
+    - **Bare hash**: entire content is a single 64-char (sha256) or 128-char (sha512) hex string.
+    - **GNU coreutils**: ``<hash>  <filename>`` or ``<hash> <filename>``
+    - **BSD style**: ``SHA256 (<filename>) = <hash>``
+
+    Returns ``(algorithm, hex_digest)`` or ``None``.
+    """
+    def _algo_from_length(hex_str: str) -> str | None:
+        if len(hex_str) == 64:
+            return "sha256"
+        if len(hex_str) == 128:
+            return "sha512"
+        return None
+
+    stripped = content.strip()
+
+    # Bare hash (single-file checksum)
+    if re.fullmatch(r"[0-9a-fA-F]+", stripped):
+        algo = _algo_from_length(stripped)
+        if algo:
+            return algo, stripped.lower()
+
+    # Try each non-empty line
+    for line in stripped.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+
+        # BSD style: SHA256 (filename) = hash
+        m = re.match(r"(SHA256|SHA512)\s+\((.+?)\)\s*=\s*([0-9a-fA-F]+)", line)
+        if m:
+            algo_tag, fname, hex_hash = m.group(1), m.group(2), m.group(3)
+            if fname == target_filename:
+                algo = "sha256" if algo_tag == "SHA256" else "sha512"
+                return algo, hex_hash.lower()
+            continue
+
+        # GNU coreutils: hash  filename  or  hash filename
+        parts = line.split(None, 1)
+        if len(parts) == 2:
+            hex_hash, fname = parts
+            # GNU format may have a leading * or space-mode indicator before filename
+            fname = fname.lstrip("*").strip()
+            if re.fullmatch(r"[0-9a-fA-F]+", hex_hash) and fname == target_filename:
+                algo = _algo_from_length(hex_hash)
+                if algo:
+                    return algo, hex_hash.lower()
+
+    return None
+
+
+def compute_file_hash(filepath: str, algorithm: str) -> str:
+    """Compute the hex digest of *filepath* using *algorithm* (e.g. 'sha256')."""
+    h = hashlib.new(algorithm)
+    with open(filepath, "rb") as f:
+        while True:
+            chunk = f.read(1 << 16)  # 64 KB
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def verify_checksum(assets: list[dict], binary_asset: dict, downloaded_path: str) -> None:
+    """Verify the downloaded file against a checksum from the release assets.
+
+    - No checksum asset found → warn and return (opportunistic).
+    - Download/parse failure → warn and return.
+    - Hash mismatch → raise :class:`ChecksumError` (hard fail).
+    - Hash match → info message.
+    """
+    result = find_checksum_asset(assets, binary_asset["name"])
+    if result is None:
+        _warn("No checksum file found in release assets; skipping verification")
+        return
+
+    cksum_asset, algo_hint = result
+    _info(f"Downloading checksum file: {cksum_asset['name']}")
+    try:
+        cksum_tmp = download(cksum_asset["url"])
+        try:
+            cksum_content = cksum_tmp.read().decode("utf-8", errors="replace")
+        finally:
+            cksum_tmp.close()
+    except (ApiError, OSError) as exc:
+        _warn(f"Failed to download checksum file: {exc}")
+        return
+
+    parsed = parse_checksum(cksum_content, binary_asset["name"])
+    if parsed is None:
+        _warn(f"Could not parse checksum for '{binary_asset['name']}' from {cksum_asset['name']}")
+        return
+
+    algorithm, expected = parsed
+    _info(f"Expected {algorithm} hash: {expected}")
+    actual = compute_file_hash(downloaded_path, algorithm)
+    _info(f"Computed {algorithm} hash: {actual}")
+
+    if actual != expected:
+        raise ChecksumError(
+            f"Checksum mismatch for {binary_asset['name']}!\n"
+            f"  Expected ({algorithm}): {expected}\n"
+            f"  Got:                    {actual}"
+        )
+    print(f"Checksum OK ({algorithm})", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
 # Archive member selection
 # ---------------------------------------------------------------------------
 
@@ -495,6 +663,8 @@ def set_symlink(bin_dir: Path, binary: str, tag: str, *,
 
 def install_binary(bin_dir: Path, pkg: PackageEntry, tag: str,
                    asset: dict, reason: str, *,
+                   assets: list[dict] | None = None,
+                   skip_verify: bool = False,
                    dry_run: bool = False) -> bool:
     """Download and install a specific release asset. Returns True if installed."""
     binary = pkg.binary
@@ -519,6 +689,9 @@ def install_binary(bin_dir: Path, pkg: PackageEntry, tag: str,
         tmp = download(url)
         state["tmp"] = tmp
         try:
+            if not skip_verify and assets is not None:
+                verify_checksum(assets, asset, tmp.name)
+                tmp.seek(0)
             extract_binary(tmp, asset["name"], binary, dest)
         finally:
             tmp.close()
@@ -532,7 +705,8 @@ def install_binary(bin_dir: Path, pkg: PackageEntry, tag: str,
 # ---------------------------------------------------------------------------
 
 def cmd_install(cfg: Config, dry_run: bool,
-                name: str, tag: str | None) -> None:
+                name: str, tag: str | None, *,
+                skip_verify: bool = False) -> None:
     """Install latest (or specific tag) for one or all packages."""
     if name == "all":
         if not cfg.packages:
@@ -556,6 +730,7 @@ def cmd_install(cfg: Config, dry_run: bool,
             asset, reason = select_asset(assets, pkg)
             _info(f"{pkg.name}: {reason}")
             installed = install_binary(cfg.bin_dir, pkg, rel_tag, asset, reason,
+                                       assets=assets, skip_verify=skip_verify,
                                        dry_run=dry_run)
             set_symlink(cfg.bin_dir, pkg.binary, rel_tag, dry_run=dry_run)
             if installed:
@@ -700,6 +875,8 @@ def build_parser() -> _Parser:
     p_install = sub.add_parser("install", description="Install latest or a specific version.")
     p_install.add_argument("name", help="package name (use 'all' to install all packages)")
     p_install.add_argument("tag", nargs="?", help="specific tag to install")
+    p_install.add_argument("--no-verify", dest="skip_verify", action="store_true",
+                           help="skip checksum verification")
 
     p_use = sub.add_parser("use", description="Switch to an installed version.")
     p_use.add_argument("name", help="package name")
@@ -728,7 +905,8 @@ def main() -> None:
     cfg = Config.load(config_path)
 
     if args.command == "install":
-        cmd_install(cfg, args.dry_run, args.name, args.tag)
+        cmd_install(cfg, args.dry_run, args.name, args.tag,
+                    skip_verify=getattr(args, "skip_verify", False))
     elif args.command == "remove":
         cmd_remove(cfg, args.dry_run, args.name)
     elif args.command == "list":

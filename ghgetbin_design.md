@@ -82,6 +82,7 @@ Inspection action:
 State actions:
   ghgetbin install <name> [tag]    # install latest for one package, or specific tag if given
                                 #   use "all" as name to install latest for all packages
+                                #   optional flag: --no-verify (skip checksum verification)
   ghgetbin use <name> <tag>        # switch active symlink to an already-installed version
 
 Global flags:
@@ -122,6 +123,25 @@ Global flags:
   2. Any member with executable bit set, excluding dirs and scripts (prefer no extension)
 - If multiple candidates found, list them, pick best match, warn user
 
+## Checksum verification
+Opportunistic integrity verification using companion checksum files from the release:
+- If a checksum asset exists for the downloaded binary, download and verify it
+- If no checksum asset is found, warn and proceed (non-blocking)
+- If checksum download or parsing fails, warn and proceed (non-blocking)
+- If the hash does not match, raise ChecksumError (hard failure — security)
+- Verification runs after download, before extraction
+
+Supported checksum asset names (checked in priority order):
+- Per-file: {asset_name}.sha256, {asset_name}.sha512, {asset_name}.sha256sum, {asset_name}.sha512sum
+- Multi-file (case-insensitive): checksums.txt, SHA256SUMS, SHA512SUMS
+
+Supported line formats in checksum files:
+- Bare hash: entire content is a single hex string (64 chars = sha256, 128 chars = sha512)
+- GNU coreutils: `<hash>  <filename>` or `<hash> <filename>`
+- BSD style: `SHA256 (<filename>) = <hash>`
+
+The `--no-verify` flag on the `install` subcommand skips verification entirely.
+
 ## Installing a version
 - Destination path: {bin_dir}/{binary}-{tag}  e.g. ~/bin/fzf-v0.55.0
 - Error if bin_dir does not exist — user is responsible for creating it
@@ -140,7 +160,7 @@ but before installation is complete:
 - On SIGINT, exit 130 after cleanup
 
 ## Error handling
-- Custom exception classes: GhbinError, AssetNotFoundError, ApiError
+- Custom exception classes: GhbinError, AssetNotFoundError, ApiError, ChecksumError
 - All errors print [ERROR] to stderr, exit non-zero
 - Warnings print [WARN] to stderr, continue
 - Network errors include the URL that failed
@@ -163,6 +183,7 @@ Module-level functions:
 - TOML serialization: _write_toml(), _escape_toml_string(), _validate_bare_key()
 - GitHub API: fetch_release(repo, tag) → release JSON dict
 - Asset selection: select_asset(assets, entry) → (asset, reason)
+- Checksum verification: find_checksum_asset(), parse_checksum(), compute_file_hash(), verify_checksum()
 - Binary extraction: extract_binary(archive_path, archive_type, binary_name) → bytes
   - Helper: _find_binary_in_archive() for member selection
 - Installation: install_binary(bin_dir, binary, tag, content) — writes versioned file
