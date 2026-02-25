@@ -19,12 +19,11 @@ write_toml() rules:
 - Validate package names and key names against bare-key rules (alphanumeric, dash,
   underscore only). Refuse to write keys that require quoting rather than trying to
   quote them.
-- Validate repo format as "owner/repo" with non-empty owner and repo parts.
 - Write tables in sorted order for deterministic output.
 
 ## File locations
 All paths are configurable via [settings] in ghgetbin.toml. Defaults:
-- Config: ~/.config/ghgetbin.toml — override with GHBIN_CONFIG env var
+- Config: ~/.config/ghgetbin.toml — override with GHGETBIN_CONFIG env var
 - Binaries: ~/bin/
 
 Expand ~ in all paths using pathlib.Path.expanduser().
@@ -59,7 +58,7 @@ otherwise the section key (e.g. "gh", "fzf", "bat").
 
 ## Config loading
 Resolve config path in this order:
-1. GHBIN_CONFIG env var if set
+1. GHGETBIN_CONFIG env var if set
 2. ~/.config/ghgetbin.toml
 
 Expand ~ in the resolved path. If the file does not exist, warn the user and continue
@@ -72,6 +71,7 @@ their short name from config.
 
 Config actions:
   ghgetbin add <name> <repo>       # add a new package entry to config
+                                #   validates repo format as "owner/repo"
                                 #   optional flags: --binary, --asset-pattern
   ghgetbin remove <name>           # remove the package entry from config only;
                                 #   does NOT delete binaries or symlinks from disk
@@ -107,7 +107,7 @@ Global flags:
 4. Score remaining candidates:
    - Prefer musl over gnu (+2)
    - Prefer .tar.gz (+3), .tar.xz (+2), .zip (+1), raw binary (0)
-   - Deprioritize sha256, .sig, .sbom, checksums (-10)
+   - Deprioritize .sha256, .sha512, .sig, .sbom, checksums, .asc, .pem (-10)
 5. Take highest scoring asset; warn with selection reason if ambiguous
 
 ## Download and extraction
@@ -132,8 +132,10 @@ Opportunistic integrity verification using companion checksum files from the rel
 - Verification runs after download, before extraction
 
 Supported checksum asset names (checked in priority order):
-- Per-file: {asset_name}.sha256, {asset_name}.sha512, {asset_name}.sha256sum, {asset_name}.sha512sum
-- Multi-file (case-insensitive): checksums.txt, SHA256SUMS, SHA512SUMS
+- Per-file (sha512 preferred — stronger and faster on 64-bit):
+  {asset_name}.sha512, {asset_name}.sha256, {asset_name}.sha512sum, {asset_name}.sha256sum
+- Multi-file (case-insensitive, also matched as suffix after _ or -):
+  checksums.txt, SHA512SUMS, SHA256SUMS, sha512.sum, sha256.sum
 
 Supported line formats in checksum files:
 - Bare hash: entire content is a single hex string (64 chars = sha256, 128 chars = sha512)
@@ -181,14 +183,14 @@ Classes:
 
 Module-level functions:
 - TOML serialization: _write_toml(), _escape_toml_string(), _validate_bare_key()
-- GitHub API: fetch_release(repo, tag) → release JSON dict
+- GitHub API: get_release(repo, tag) → release JSON dict
 - Asset selection: select_asset(assets, entry) → (asset, reason)
 - Checksum verification: find_checksum_asset(), parse_checksum(), compute_file_hash(), verify_checksum()
-- Binary extraction: extract_binary(archive_path, archive_type, binary_name) → bytes
+- Binary extraction: extract_binary(tmp, asset_name, binary_name, dest) — streams to dest file
   - Helper: _find_binary_in_archive() for member selection
-- Installation: install_binary(bin_dir, binary, tag, content) — writes versioned file
-- Symlink management: update_symlink(bin_dir, binary, tag) — atomic swap
-- Filesystem queries: list_installed(bin_dir, binary) → InstalledPackage
+- Installation: install_binary(bin_dir, pkg, tag, asset, reason) — downloads, verifies, and extracts versioned file
+- Symlink management: set_symlink(bin_dir, binary, tag) — atomic swap
+- Filesystem queries: get_installed(bin_dir, binary) → InstalledPackage
 - Commands: cmd_install, cmd_remove, cmd_list, cmd_use, cmd_add
 
 ## Code quality

@@ -75,6 +75,11 @@ def _info(msg: str) -> None:
 _BARE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
+def _validate_bare_key(name: str) -> bool:
+    """Return True if *name* is a valid TOML bare key (alphanumeric, dash, underscore)."""
+    return bool(_BARE_KEY_RE.match(name))
+
+
 def _escape_toml_string(value: str) -> str:
     return (
         value
@@ -96,12 +101,12 @@ def _write_toml(data: dict[str, dict[str, str]]) -> str:
     """
     lines: list[str] = []
     for section in sorted(data, key=lambda s: (s != "settings", s)):
-        if not _BARE_KEY_RE.match(section):
+        if not _validate_bare_key(section):
             raise GhbinError(f"Invalid TOML section name: {section!r}")
         lines.append(f"[{section}]")
         table = data[section]
         for key in sorted(table):
-            if not _BARE_KEY_RE.match(key):
+            if not _validate_bare_key(key):
                 raise GhbinError(f"Invalid TOML key name: {key!r}")
             val = _escape_toml_string(table[key])
             lines.append(f'{key} = "{val}"')
@@ -446,7 +451,7 @@ def verify_checksum(assets: list[dict], binary_asset: dict, downloaded_path: str
         _warn("No checksum file found in release assets; skipping verification")
         return
 
-    cksum_asset, algo_hint = result
+    cksum_asset, _ = result
     _info(f"Downloading checksum file: {cksum_asset['name']}")
     try:
         cksum_tmp = download(cksum_asset["url"])
@@ -527,7 +532,7 @@ def _install_guard(dest: Path):
     state: dict[str, tempfile.NamedTemporaryFile | None] = {"tmp": None}  # type: ignore[type-arg]
     original = signal.getsignal(signal.SIGINT)
 
-    def _handler(signum: int, frame: object) -> None:
+    def _handler(_signum: int, _frame: object) -> None:
         if dest.exists():
             try:
                 dest.unlink()
@@ -599,10 +604,15 @@ def download(url: str) -> tempfile.NamedTemporaryFile:  # type: ignore[type-arg]
         resp = urlopen(req)
     except (HTTPError, URLError) as exc:
         raise ApiError(f"Download failed for {url}: {exc}") from exc
-    tmp = tempfile.NamedTemporaryFile(delete=True)
-    shutil.copyfileobj(resp, tmp, 1 << 16)
-    tmp.flush()
-    tmp.seek(0)
+    tmp = tempfile.NamedTemporaryFile()
+    try:
+        with resp:
+            shutil.copyfileobj(resp, tmp, 1 << 16)
+        tmp.flush()
+        tmp.seek(0)
+    except BaseException:
+        tmp.close()
+        raise
     return tmp
 
 
@@ -800,7 +810,7 @@ def cmd_add(cfg: Config, dry_run: bool, name: str, repo: str, binary: str | None
     if name in cfg.packages:
         _err(f"Package '{name}' already exists in config.")
         sys.exit(1)
-    if not _BARE_KEY_RE.match(name):
+    if not _validate_bare_key(name):
         _err(f"Invalid package name '{name}' (alphanumeric, dash, underscore only).")
         sys.exit(1)
     parts = repo.split("/")
@@ -906,7 +916,7 @@ def main() -> None:
 
     if args.command == "install":
         cmd_install(cfg, args.dry_run, args.name, args.tag,
-                    skip_verify=getattr(args, "skip_verify", False))
+                    skip_verify=args.skip_verify)
     elif args.command == "remove":
         cmd_remove(cfg, args.dry_run, args.name)
     elif args.command == "list":
